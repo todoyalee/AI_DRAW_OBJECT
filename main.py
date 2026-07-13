@@ -6,6 +6,7 @@ import threading
 import queue
 import difflib
 from time import time
+from datetime import datetime
 from collections import deque
 
 # ============================================
@@ -37,23 +38,37 @@ THUMB_OUT_RATIO = 0.85
 # doesn't fire by accident while passing through)
 UI_CLICK_HOLD_FRAMES = 5
 
-# frames the open-hand (5 fingers) pose must hold before OCR fires
-# kept short on purpose so OCR feels instant, per your request
-FIVE_FINGER_HOLD_FRAMES = 3
+# frames a gesture must hold before it fires -- long enough to be a deliberate,
+# unambiguous action (this is what tells the system "I'm done writing", instead of
+# guessing from timing), short enough that it still feels responsive
+CONFIRM_HOLD_FRAMES = 8   # closed fist = confirm/submit whatever you just wrote
+UNDO_HOLD_FRAMES = 8      # open palm = undo/erase
+
+# how many recent frames vote on each finger's up/down state before we trust it.
+# raw per-frame landmark position is jittery enough that a single bad frame can
+# drop a stroke mid-letter or misfire a gesture -- majority-voting over a short
+# window smooths that out without adding noticeable input lag.
+GESTURE_SMOOTH_FRAMES = 4
 
 FUZZY_MATCH_CUTOFF = 0.55
 
-OBJECT_SIZE = 320   # bigger, so it reads as "floating on your hand" not a small icon
+SCAN_SLICE_COUNT = 3
+ALERT_DURATION = 3.0    # seconds an alert banner stays up
+POP_DURATION = 0.3      # seconds for a panel's spawn/refresh bounce
 
 DEBUG_SHOW_OCR_CROP = False
 
-# Neon color palette (BGR order, since OpenCV uses BGR not RGB)
+# clinical HUD palette (BGR order, since OpenCV uses BGR not RGB)
 NEON_COLORS = {
-    "blue":  (255, 217, 4),
-    "pink":  (147, 20, 255),
+    "cyan":  (255, 220, 0),
+    "amber": (0, 191, 255),
     "green": (20, 255, 57),
 }
-DEFAULT_COLOR_KEY = "blue"
+DEFAULT_COLOR_KEY = "cyan"
+
+PANEL_BG = (35, 24, 15)        # dark navy-ish panel background
+PANEL_BORDER = (255, 200, 80)  # cyan/amber border
+ALERT_COLOR = (0, 60, 255)     # red-ish alert banner
 
 # ============================================
 # MEDIAPIPE
@@ -71,47 +86,87 @@ hands = mp_hands.Hands(
 draw = mp.solutions.drawing_utils
 
 # ============================================
+# COMMAND VOCABULARY
+# ============================================
+# Every recognized word maps to an ACTION, not a picture -- this is the same
+# "write a word -> something happens" mechanic as before, generalized into a
+# small command registry. Adding a new command later is one dict entry below,
+# not new gesture/rendering code.
+
+COMMANDS = {
+    "xray":        {"type": "scan", "modality": "XRAY"},
+    "mri":         {"type": "scan", "modality": "MRI"},
+    "checklist":   {"type": "checklist"},
+    "allergy":     {"type": "patient", "field": "allergy"},
+    "bloodtype":   {"type": "patient", "field": "bloodtype"},
+    "incision":    {"type": "log", "label": "INCISION"},
+    "close":       {"type": "log", "label": "CLOSE"},
+    "blood":       {"type": "alert", "target": "Blood Bank"},
+    "anesthesia":  {"type": "alert", "target": "Anesthesiologist"},
+    "cam2":        {"type": "cam_toggle"},
+    "morphine":    {"type": "drug", "name": "MORPHINE", "dose": "2-4 mg IV, q2-4h PRN"},
+    "epinephrine": {"type": "drug", "name": "EPINEPHRINE", "dose": "0.1 mg IV (1:10,000) - cardiac arrest dose"},
+}
+
+# words that act on whatever's currently displayed, instead of replacing it
+MODIFIER_WORDS = {"next", "zoom"}
+
+ALL_VOCAB = list(COMMANDS.keys()) + list(MODIFIER_WORDS)
+
+# Public-domain WHO Surgical Safety Checklist items (paraphrased), cycled with "NEXT"
+CHECKLIST_STEPS = [
+    "SIGN IN - Confirm patient identity, site, procedure, and consent",
+    "SIGN IN - Site marked, or marking not applicable",
+    "TIME OUT - Team introduces name and role",
+    "TIME OUT - Surgeon reviews critical or unexpected steps",
+    "TIME OUT - Antibiotic prophylaxis given in last 60 min",
+    "SIGN OUT - Instrument, sponge, and needle counts correct",
+    "SIGN OUT - Specimen labeled correctly",
+]
+
+# mock data for the demo only -- not real patient records
+PATIENT_INFO = {
+    "allergy": "Penicillin (rash), Latex (mild)",
+    "bloodtype": "O Negative",
+}
+
+# ============================================
 # OCR (runs in a background thread so it never blocks the camera loop)
 # ============================================
 
 reader = easyocr.Reader(['en'], gpu=False)
-
-VALID_WORDS = {
-    "apple": "apple",
-    "pen": "pen",
-    "egg": "egg",
-}
 
 ocr_input_queue = queue.Queue()
 ocr_result_queue = queue.Queue()
 
 
 def fuzzy_match(text_nospace):
-    """Snap a messy OCR guess to the closest valid word instead of
+    """Snap a messy OCR guess to the closest known command word instead of
     requiring an exact match."""
-    candidate_keys = list(VALID_WORDS.keys())
-    candidate_nospace = [c.replace(" ", "") for c in candidate_keys]
+    candidates_nospace = [c.replace(" ", "") for c in ALL_VOCAB]
     close = difflib.get_close_matches(
-        text_nospace, candidate_nospace, n=1, cutoff=FUZZY_MATCH_CUTOFF
+        text_nospace, candidates_nospace, n=1, cutoff=FUZZY_MATCH_CUTOFF
     )
     if not close:
         return ""
-    matched_key = candidate_keys[candidate_nospace.index(close[0])]
-    return VALID_WORDS[matched_key]
+    return ALL_VOCAB[candidates_nospace.index(close[0])]
 
 
 def recognize_word(image):
-    result = reader.readtext(image, detail=0, paragraph=False)
+    result = reader.readtext(image, detail=1, paragraph=False)
     if len(result) == 0:
-        return ""
-    text = " ".join(result).lower()
+        return "", 0.0
+
+    text = " ".join(r[1] for r in result).lower()
     text = text.replace("-", " ").replace("_", " ").strip()
-    if text in VALID_WORDS:
-        return VALID_WORDS[text]
+    confidence = float(np.mean([r[2] for r in result]))
+
+    if text in ALL_VOCAB:
+        return text, confidence
     text_nospace = text.replace(" ", "")
-    if text_nospace in VALID_WORDS:
-        return VALID_WORDS[text_nospace]
-    return fuzzy_match(text_nospace)
+    if text_nospace in ALL_VOCAB:
+        return text_nospace, confidence
+    return fuzzy_match(text_nospace), confidence
 
 
 def ocr_worker():
@@ -119,8 +174,8 @@ def ocr_worker():
         img = ocr_input_queue.get()
         if img is None:
             break
-        word = recognize_word(img)
-        ocr_result_queue.put(word)
+        word, confidence = recognize_word(img)
+        ocr_result_queue.put((word, confidence))
 
 
 ocr_thread = threading.Thread(target=ocr_worker, daemon=True)
@@ -138,57 +193,74 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
-cv2.namedWindow("Magic Objects", cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty("Magic Objects", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+cv2.namedWindow("Touchless OR Interface", cv2.WND_PROP_FULLSCREEN)
+cv2.setWindowProperty("Touchless OR Interface", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 try:
     # Pull the window to the front so it actually has keyboard focus.
     # (Not supported on every OpenCV build/backend - safe to ignore if it errors.)
-    cv2.setWindowProperty("Magic Objects", cv2.WND_PROP_TOPMOST, 1)
+    cv2.setWindowProperty("Touchless OR Interface", cv2.WND_PROP_TOPMOST, 1)
 except cv2.error:
     pass
 
 # ============================================
-# LOAD PNG OBJECTS
+# SYNTHETIC SCAN IMAGERY
 # ============================================
+# Procedurally generated placeholder scans -- deliberately NOT real patient
+# imagery, so there's no licensing or privacy risk in a demo. Swap in real
+# licensed sample images later; nothing else in the system cares where the
+# pixels come from.
 
-OBJECT_IMAGES = {
-    "apple": cv2.imread("images/apple.png", cv2.IMREAD_UNCHANGED),
-    "pen": cv2.imread("images/pen.png", cv2.IMREAD_UNCHANGED),
-    "egg": cv2.imread("images/egg.png", cv2.IMREAD_UNCHANGED),   # <-- replaced ice cream
+SCAN_PANEL_SIZE = 420
+
+
+def generate_scan_image(modality, slice_idx):
+    img = np.full((SCAN_PANEL_SIZE, SCAN_PANEL_SIZE, 3), 18, dtype=np.uint8)
+    rng = np.random.default_rng(seed=(hash(modality) & 0xFFFF) + slice_idx * 97)
+    line_color = (235, 235, 235) if modality == "XRAY" else (255, 225, 190)
+    for _ in range(6):
+        cx = SCAN_PANEL_SIZE // 2 + int(rng.integers(-80, 80))
+        cy = SCAN_PANEL_SIZE // 2 + int(rng.integers(-80, 80)) + slice_idx * 10
+        axes = (int(rng.integers(25, 75)), int(rng.integers(40, 115)))
+        angle = int(rng.integers(0, 180))
+        cv2.ellipse(img, (cx, cy), axes, angle, 0, 360, line_color, thickness=int(rng.integers(2, 5)))
+    cv2.putText(img, f"{modality} - SAMPLE (SYNTHETIC)", (14, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"Slice {slice_idx + 1}/{SCAN_SLICE_COUNT}", (14, SCAN_PANEL_SIZE - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
+    return img
+
+
+SCAN_IMAGES = {
+    modality: [generate_scan_image(modality, i) for i in range(SCAN_SLICE_COUNT)]
+    for modality in ("XRAY", "MRI")
 }
 
-for key, img in OBJECT_IMAGES.items():
-    if img is not None:
-        # Some PNGs (like your apple.png) have no alpha channel -- only 3 channels (BGR).
-        # overlay_png() needs a 4th (alpha) channel to know what's transparent, so if it's
-        # missing we add one here, treating the whole image as fully opaque.
-        if img.shape[2] == 3:
-            alpha_channel = np.full(img.shape[:2], 255, dtype=img.dtype)
-            img = cv2.merge([img[:, :, 0], img[:, :, 1], img[:, :, 2], alpha_channel])
 
-        h, w = img.shape[:2]
-        scale = OBJECT_SIZE / w
-        OBJECT_IMAGES[key] = cv2.resize(
-            img, (OBJECT_SIZE, int(h * scale)), interpolation=cv2.INTER_AREA
-        )
-
-print("Apple:", OBJECT_IMAGES["apple"] is not None)
-print("Pen:", OBJECT_IMAGES["pen"] is not None)
-print("Egg:", OBJECT_IMAGES["egg"] is not None)
+def get_scan_display(view):
+    img = SCAN_IMAGES[view["modality"]][view["slice"]]
+    if view.get("zoom"):
+        ih, iw = img.shape[:2]
+        ch, cw = int(ih * 0.5), int(iw * 0.5)
+        y0, x0 = (ih - ch) // 2, (iw - cw) // 2
+        img = cv2.resize(img[y0:y0+ch, x0:x0+cw], (iw, ih), interpolation=cv2.INTER_LINEAR)
+    return img
 
 # ============================================
 # STATE
 # ============================================
 
-MODE_WRITE = "write"
-MODE_OBJECT = "object"
-mode = MODE_WRITE
-
 canvas = None
 points = deque(maxlen=5000)
 drawing = False
-recognized_word = ""
-current_object = None
+
+active_view = None      # dict describing whatever info panel is on screen, or None
+view_spawn_time = 0.0
+cam2_on = False
+event_log = []          # list of (time_str, label), most recent last
+
+status_message = ""
+status_message_until = 0.0
+
 pen_color_key = DEFAULT_COLOR_KEY
 
 object_x = 0
@@ -198,7 +270,15 @@ smooth_x = None
 smooth_y = None
 
 frame_count = 0
-five_finger_counter = 0
+frame_times = deque(maxlen=30)
+
+confirm_counter = 0
+undo_counter = 0
+
+index_up_hist = deque(maxlen=GESTURE_SMOOTH_FRAMES)
+thumb_out_hist = deque(maxlen=GESTURE_SMOOTH_FRAMES)
+open_hand_hist = deque(maxlen=GESTURE_SMOOTH_FRAMES)
+fist_hist = deque(maxlen=GESTURE_SMOOTH_FRAMES)
 
 # UI layout (computed once from first frame size)
 ui_layout_ready = False
@@ -217,22 +297,29 @@ ui_action_armed = True   # False right after a click fires, True again once pinc
 # HELPERS
 # ============================================
 
-def overlay_png(background, png, center_x, center_y):
-    if png is None:
-        return
-    h, w = png.shape[:2]
-    x = int(center_x - w / 2)
-    y = int(center_y - h / 2)
-    # clamp instead of hiding the object when it nears the edge
-    x = max(0, min(x, background.shape[1] - w - 1))
-    y = max(0, min(y, background.shape[0] - h - 1))
+def ease_out_back(t):
+    """Overshoot-then-settle easing (0->1), used for a panel's spawn bounce."""
+    c1 = 1.70158
+    c3 = c1 + 1
+    t -= 1
+    return 1 + c3 * (t ** 3) + c1 * (t ** 2)
 
-    alpha = png[:, :, 3] / 255.0
-    rgb = png[:, :, :3]
-    roi = background[y:y+h, x:x+w]
-    for c in range(3):
-        roi[:, :, c] = alpha * rgb[:, :, c] + (1 - alpha) * roi[:, :, c]
-    background[y:y+h, x:x+w] = roi
+
+def pop_scale(spawn_time):
+    elapsed = time() - spawn_time
+    if elapsed < POP_DURATION:
+        return max(0.05, ease_out_back(elapsed / POP_DURATION))
+    return 1.0
+
+
+def paste_panel(frame, panel_img, anchor_x, anchor_y, spawn_time):
+    scale = pop_scale(spawn_time)
+    ph, pw = panel_img.shape[:2]
+    new_w, new_h = max(1, int(pw * scale)), max(1, int(ph * scale))
+    resized = cv2.resize(panel_img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    x = max(0, min(anchor_x, frame.shape[1] - new_w - 1))
+    y = max(0, min(anchor_y, frame.shape[0] - new_h - 1))
+    frame[y:y+new_h, x:x+new_w] = resized
 
 
 def smooth_point(x, y):
@@ -323,6 +410,176 @@ def dist(a, b):
     return np.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def format_time_now():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+# ---------------- info panel renderers (each returns a fixed-size BGR image) ----------------
+
+def render_scan_panel(view):
+    img = get_scan_display(view)
+    panel = np.full((SCAN_PANEL_SIZE + 50, SCAN_PANEL_SIZE + 32, 3), PANEL_BG, dtype=np.uint8)
+    panel[36:36+SCAN_PANEL_SIZE, 16:16+SCAN_PANEL_SIZE] = img
+    cv2.rectangle(panel, (0, 0), (panel.shape[1]-1, panel.shape[0]-1), PANEL_BORDER, 2)
+    cv2.putText(panel, f"{view['modality']} VIEWER", (16, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    return panel
+
+
+def render_checklist_panel(view):
+    panel = np.full((260, 620, 3), PANEL_BG, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1]-1, panel.shape[0]-1), PANEL_BORDER, 2)
+    cv2.putText(panel, "SURGICAL SAFETY CHECKLIST", (20, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    step_text = CHECKLIST_STEPS[view["step"]]
+    words = step_text.split(" ")
+    lines, cur = [], ""
+    for word in words:
+        trial = (cur + " " + word).strip()
+        if len(trial) > 40:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+
+    for i, line in enumerate(lines):
+        cv2.putText(panel, line, (20, 76 + i * 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 255), 2, cv2.LINE_AA)
+
+    cv2.putText(panel, f"Step {view['step']+1}/{len(CHECKLIST_STEPS)}  (write NEXT to advance)",
+                (20, panel.shape[0]-18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
+    return panel
+
+
+def render_patient_panel(view):
+    panel = np.full((150, 500, 3), PANEL_BG, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1]-1, panel.shape[0]-1), PANEL_BORDER, 2)
+    label = "ALLERGIES" if view["field"] == "allergy" else "BLOOD TYPE"
+    cv2.putText(panel, label, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, PATIENT_INFO[view["field"]], (20, 86),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, "MOCK DATA - DEMO ONLY", (20, 128),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+    return panel
+
+
+def render_drug_panel(view):
+    panel = np.full((150, 520, 3), PANEL_BG, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1]-1, panel.shape[0]-1), PANEL_BORDER, 2)
+    cv2.putText(panel, view["name"], (20, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, view["dose"], (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, "MOCK DATA - VERIFY BEFORE USE", (20, 128),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+    return panel
+
+
+def render_alert_banner(frame, view):
+    remaining = view["until"] - time()
+    if remaining <= 0:
+        return False
+    pulse = 0.5 + 0.5 * np.sin(time() * 10)
+    bw, bh = frame.shape[1] - 80, 70
+    bx, by = 40, 100
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), ALERT_COLOR, -1)
+    a = 0.35 + 0.25 * pulse
+    cv2.addWeighted(overlay, a, frame, 1 - a, 0, frame)
+    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (255, 255, 255), 2)
+    cv2.putText(frame, f"ALERT SENT -> {view['target'].upper()}", (bx + 24, by + 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    return True
+
+
+def render_cam2_inset(frame):
+    fh, fw = frame.shape[:2]
+    iw, ih = 260, 150
+    x, y = fw - iw - 30, fh - ih - 30
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 140)
+    edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    inset = cv2.resize(edges_bgr, (iw, ih), interpolation=cv2.INTER_LINEAR)
+    frame[y:y+ih, x:x+iw] = inset
+    cv2.rectangle(frame, (x, y), (x+iw, y+ih), PANEL_BORDER, 2)
+    cv2.putText(frame, "CAM 2 (SIMULATED)", (x+8, y+20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def render_event_log(frame):
+    if not event_log:
+        return
+    x = 25
+    y = frame.shape[0] - 25 - 22 * len(event_log)
+    cv2.putText(frame, "PROCEDURE LOG", (x, y - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+    for i, (ts, label) in enumerate(event_log):
+        cv2.putText(frame, f"{ts}  {label}", (x, y + i * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1, cv2.LINE_AA)
+
+
+def render_hud(frame):
+    if len(frame_times) >= 2:
+        fps = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
+    else:
+        fps = 0.0
+    cv2.putText(frame, f"{fps:4.1f} FPS", (frame.shape[1] - 150, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 120), 2, cv2.LINE_AA)
+
+    if time() < status_message_until:
+        cv2.putText(frame, status_message, (25, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2, cv2.LINE_AA)
+
+    if ocr_busy:
+        pulse = int(180 + 75 * np.sin(time() * 6))
+        cv2.putText(frame, "Reading...", (25, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, pulse, 255), 2)
+
+
+# ---------------- command execution ----------------
+
+def execute_command(key):
+    global active_view, cam2_on, view_spawn_time
+    cmd = COMMANDS[key]
+    kind = cmd["type"]
+
+    if kind == "scan":
+        active_view = {"type": "scan", "modality": cmd["modality"], "slice": 0, "zoom": False}
+    elif kind == "checklist":
+        active_view = {"type": "checklist", "step": 0}
+    elif kind == "patient":
+        active_view = {"type": "patient", "field": cmd["field"]}
+    elif kind == "drug":
+        active_view = {"type": "drug", "name": cmd["name"], "dose": cmd["dose"]}
+    elif kind == "log":
+        event_log.append((format_time_now(), cmd["label"]))
+        del event_log[:-5]
+    elif kind == "alert":
+        active_view = {"type": "alert", "target": cmd["target"], "until": time() + ALERT_DURATION}
+    elif kind == "cam_toggle":
+        cam2_on = not cam2_on
+
+    view_spawn_time = time()
+
+
+def apply_modifier(key):
+    global view_spawn_time
+    if active_view is None:
+        return
+    if key == "next":
+        if active_view["type"] == "scan":
+            active_view["slice"] = (active_view["slice"] + 1) % SCAN_SLICE_COUNT
+            view_spawn_time = time()
+        elif active_view["type"] == "checklist":
+            active_view["step"] = (active_view["step"] + 1) % len(CHECKLIST_STEPS)
+            view_spawn_time = time()
+    elif key == "zoom":
+        if active_view["type"] == "scan":
+            active_view["zoom"] = not active_view.get("zoom", False)
+            view_spawn_time = time()
+
+
 # ============================================
 # MAIN LOOP
 # ============================================
@@ -333,6 +590,7 @@ while True:
     if not success:
         break
     frame = cv2.flip(frame, 1)
+    frame_times.append(time())
 
     h, w = frame.shape[:2]
     if not ui_layout_ready:
@@ -346,6 +604,7 @@ while True:
     results = hands.process(rgb)
 
     trigger_ocr = False
+    trigger_undo = False
 
     if results.multi_hand_landmarks:
         hand = results.multi_hand_landmarks[0]
@@ -379,14 +638,26 @@ while True:
         # thumb "out" = thumb tip far from index KNUCKLE -> pause writing
         mcp_x, mcp_y = int(index_mcp.x * w), int(index_mcp.y * h)
         thumb_mcp_dist = np.hypot(tx - mcp_x, ty - mcp_y)
-        thumb_out = scale > 0 and (thumb_mcp_dist / scale) > THUMB_OUT_RATIO
+        raw_thumb_out = scale > 0 and (thumb_mcp_dist / scale) > THUMB_OUT_RATIO
 
-        index_up = index_tip.y < index_pip.y
+        raw_index_up = index_tip.y < index_pip.y
         middle_up = middle_tip.y < middle_pip.y
         ring_up = ring_tip.y < ring_pip.y
         pinky_up = pinky_tip.y < pinky_pip.y
+        raw_open_hand = raw_index_up and middle_up and ring_up and pinky_up
+        raw_fist = (not raw_index_up) and (not middle_up) and (not ring_up) and (not pinky_up) and (not raw_thumb_out)
 
-        open_hand = index_up and middle_up and ring_up and pinky_up
+        # majority-vote each gesture over the last few frames so a single jittery
+        # landmark reading doesn't drop a stroke or misfire a gesture
+        index_up_hist.append(raw_index_up)
+        thumb_out_hist.append(raw_thumb_out)
+        open_hand_hist.append(raw_open_hand)
+        fist_hist.append(raw_fist)
+
+        index_up = sum(index_up_hist) > len(index_up_hist) / 2
+        thumb_out = sum(thumb_out_hist) > len(thumb_out_hist) / 2
+        open_hand = sum(open_hand_hist) > len(open_hand_hist) / 2
+        fist = sum(fist_hist) > len(fist_hist) / 2
 
         # ---------------- UI interaction: slider + color palette ----------------
         handled_by_ui = False
@@ -433,22 +704,29 @@ while True:
             ui_hover_counter = 0
             ui_action_armed = True
 
-        # ---------------- OCR trigger: open hand (5 fingers) ----------------
-        if mode == MODE_WRITE and open_hand and not handled_by_ui:
-            five_finger_counter += 1
+        # ---------------- CONFIRM: closed fist held -> submit what you just wrote ----------------
+        if fist and not handled_by_ui:
+            confirm_counter += 1
         else:
-            five_finger_counter = 0
+            confirm_counter = 0
 
         trigger_ocr = (
-            mode == MODE_WRITE
-            and five_finger_counter == FIVE_FINGER_HOLD_FRAMES
+            confirm_counter == CONFIRM_HOLD_FRAMES
             and len(points) > 10
             and not ocr_busy
         )
 
-        # ---------------- WRITE MODE ----------------
-        if mode == MODE_WRITE and not handled_by_ui:
-            if index_up and not thumb_out and not open_hand:
+        # ---------------- UNDO: open palm held -> clear stroke, or dismiss current view ----------------
+        if open_hand and not handled_by_ui:
+            undo_counter += 1
+        else:
+            undo_counter = 0
+
+        trigger_undo = undo_counter == UNDO_HOLD_FRAMES
+
+        # ---------------- WRITE ----------------
+        if not handled_by_ui:
+            if index_up and not thumb_out and not fist:
                 drawing = True
                 cv2.circle(frame, (x, y), 14, (255, 255, 255), -1)
                 cv2.circle(frame, (x, y), 24, NEON_COLORS[pen_color_key], 3)
@@ -475,23 +753,23 @@ while True:
                     points.append(None)
                 drawing = False
 
-        # ---------------- OBJECT MODE: object follows index fingertip ----------------
-        if mode == MODE_OBJECT:
-            object_x += int((x - object_x) * 0.35)
-            object_y += int((y - object_y) * 0.35)
-
     else:
         smooth_x = None
         smooth_y = None
         if drawing:
             points.append(None)
         drawing = False
-        five_finger_counter = 0
+        confirm_counter = 0
+        undo_counter = 0
         ui_hover_target = None
         ui_hover_counter = 0
+        index_up_hist.clear()
+        thumb_out_hist.clear()
+        open_hand_hist.clear()
+        fist_hist.clear()
 
     # ============================================
-    # NEON RENDER
+    # NEON RENDER (writing canvas glow)
     # ============================================
 
     small = cv2.resize(canvas, None, fx=GLOW_DOWNSCALE, fy=GLOW_DOWNSCALE,
@@ -506,7 +784,23 @@ while True:
     frame[mask] = (255, 255, 255)   # bright white core, colored neon glow around it
 
     # ============================================
-    # OCR TRIGGER + RESULT (non-blocking)
+    # UNDO / ERASE
+    # ============================================
+
+    if trigger_undo:
+        if len(points) > 0:
+            canvas[:] = 0
+            points.clear()
+            status_message = "Cleared"
+        elif active_view is not None:
+            active_view = None
+            status_message = "Dismissed"
+        else:
+            status_message = "Nothing to undo"
+        status_message_until = time() + 1.5
+
+    # ============================================
+    # CONFIRM -> OCR -> COMMAND EXECUTION (non-blocking)
     # ============================================
 
     if trigger_ocr:
@@ -520,26 +814,50 @@ while True:
         canvas[:] = 0
 
     try:
-        word = ocr_result_queue.get_nowait()
+        key_word, confidence = ocr_result_queue.get_nowait()
         ocr_busy = False
-        if word != "" and word in OBJECT_IMAGES and OBJECT_IMAGES[word] is not None:
-            recognized_word = word
-            current_object = OBJECT_IMAGES[word]
-            object_x = frame.shape[1] // 2
-            object_y = frame.shape[0] // 2
-            mode = MODE_OBJECT
-            print("Detected:", word)
+        if key_word in MODIFIER_WORDS:
+            apply_modifier(key_word)
+            status_message = f"{key_word.upper()} ({confidence*100:.0f}%)"
+            print("Modifier:", key_word)
+        elif key_word in COMMANDS:
+            execute_command(key_word)
+            status_message = f"{key_word.upper()} ({confidence*100:.0f}%)"
+            print("Command:", key_word)
         else:
+            status_message = f"Not recognized ({confidence*100:.0f}%)"
             print("Word not recognized")
+        status_message_until = time() + 2.5
     except queue.Empty:
         pass
 
     # ============================================
-    # DRAW OBJECT (follows index finger until R is pressed)
+    # ACTIVE VIEW (scan / checklist / patient / drug / alert)
     # ============================================
 
-    if mode == MODE_OBJECT and current_object is not None:
-        overlay_png(frame, current_object, object_x, object_y)
+    if active_view is not None:
+        vtype = active_view["type"]
+        if vtype == "alert":
+            still_active = render_alert_banner(frame, active_view)
+            if not still_active:
+                active_view = None
+        else:
+            panel = None
+            if vtype == "scan":
+                panel = render_scan_panel(active_view)
+            elif vtype == "checklist":
+                panel = render_checklist_panel(active_view)
+            elif vtype == "patient":
+                panel = render_patient_panel(active_view)
+            elif vtype == "drug":
+                panel = render_drug_panel(active_view)
+            if panel is not None:
+                paste_panel(frame, panel, w - panel.shape[1] - 40, 100, view_spawn_time)
+
+    if cam2_on:
+        render_cam2_inset(frame)
+
+    render_event_log(frame)
 
     # ============================================
     # UI OVERLAY
@@ -548,25 +866,16 @@ while True:
     draw_ui(frame)
 
     # ============================================
-    # HUD (kept minimal on purpose)
+    # HUD
     # ============================================
 
-    if mode == MODE_WRITE:
-        cv2.putText(frame, "MODE : WRITE", (25, 45),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-    else:
-        cv2.putText(frame, f"OBJECT : {recognized_word.upper()}  (R = write again)",
-                    (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-    if ocr_busy:
-        cv2.putText(frame, "Reading...", (25, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+    render_hud(frame)
 
     # ============================================
     # SHOW FRAME
     # ============================================
 
-    cv2.imshow("Magic Objects", frame)
+    cv2.imshow("Touchless OR Interface", frame)
     key = cv2.waitKey(1) & 0xFF
 
     if key == 27 or key == ord("q") or key == ord("Q"):
@@ -575,11 +884,12 @@ while True:
         canvas[:] = 0
         points.clear()
     elif key == ord("r") or key == ord("R"):
-        mode = MODE_WRITE
         canvas[:] = 0
         points.clear()
-        recognized_word = ""
-        current_object = None
+        active_view = None
+        cam2_on = False
+        event_log = []
+        status_message = ""
 
 # ============================================
 # CLEANUP
